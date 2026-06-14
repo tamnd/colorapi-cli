@@ -75,11 +75,21 @@ type SchemeColor struct {
 // --- raw API response shapes ---
 
 type apiColor struct {
-	Hex  struct{ Value string `json:"value"` } `json:"hex"`
-	RGB  struct{ Value string `json:"value"` } `json:"rgb"`
-	HSL  struct{ Value string `json:"value"` } `json:"hsl"`
-	HSV  struct{ Value string `json:"value"` } `json:"hsv"`
-	CMYK struct{ Value string `json:"value"` } `json:"cmyk"`
+	Hex struct {
+		Value string `json:"value"`
+	} `json:"hex"`
+	RGB struct {
+		Value string `json:"value"`
+	} `json:"rgb"`
+	HSL struct {
+		Value string `json:"value"`
+	} `json:"hsl"`
+	HSV struct {
+		Value string `json:"value"`
+	} `json:"hsv"`
+	CMYK struct {
+		Value string `json:"value"`
+	} `json:"cmyk"`
 	Name struct {
 		Value          string `json:"value"`
 		ExactMatchName bool   `json:"exact_match_name"`
