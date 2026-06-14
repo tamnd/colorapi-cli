@@ -2,7 +2,7 @@ package colorapi
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -14,64 +14,55 @@ import (
 //
 //	import _ "github.com/tamnd/colorapi-cli/colorapi"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// colorapi:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone colorapi binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The same Domain also builds the standalone colorapi binary (see cli.NewApp).
 func init() { kit.Register(Domain{}) }
 
-// Domain is the colorapi driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the colorapi driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "colorapi",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "colorapi",
-			Short:  "A command line for colorapi.",
-			Long: `A command line for colorapi.
-
-colorapi reads public colorapi data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+			Short:  "Identify colors and generate color schemes from The Color API",
+			Long: `colorapi fetches color data from thecolorapi.com — identify a color in any
+color space (hex, RGB, HSL) and get its name, hex, RGB, HSL, HSV, and CMYK
+representations, or generate harmonious color schemes. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/colorapi-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `colorapi page` and
-	// `ant get colorapi://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// id: identify a color by hex, rgb, or hsl
+	kit.Handle(app, kit.OpMeta{
+		Name:    "id",
+		Group:   "read",
+		Single:  true,
+		Summary: "Identify a color and get its properties",
+	}, identifyOp)
 
-	// List op: members of a page, the home of `colorapi links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// colorapi://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// scheme: generate a color scheme from a base hex color
+	kit.Handle(app, kit.OpMeta{
+		Name:    "scheme",
+		Group:   "read",
+		List:    true,
+		Summary: "Generate a color scheme from a base hex color",
+		Args:    []kit.Arg{{Name: "hex", Help: "base color hex code (e.g. 0047AB or #0047AB)"}},
+	}, schemeOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +73,91 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type identifyInput struct {
+	Hex    string  `kit:"flag" help:"hex color code (e.g. 0047AB or #0047AB)"`
+	Rgb    string  `kit:"flag" help:"RGB color as r,g,b (e.g. 0,71,171)"`
+	Hsl    string  `kit:"flag" help:"HSL color as h,s,l (e.g. 215,100,34)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type schemeInput struct {
+	Hex    string  `kit:"arg" help:"base color hex code (e.g. 0047AB or #0047AB)"`
+	Mode   string  `kit:"flag" default:"complement" help:"scheme mode: monochrome, monochrome-dark, monochrome-light, analogic, complement, analogic-complement, triad, quad"`
+	Count  int     `kit:"flag" default:"5" help:"number of colors to return"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func identifyOp(ctx context.Context, in identifyInput, emit func(*ColorInfo) error) error {
+	if in.Hex == "" && in.Rgb == "" && in.Hsl == "" {
+		return errs.Usage("one of --hex, --rgb, or --hsl is required")
+	}
+	info, err := in.Client.Identify(ctx, in.Hex, in.Rgb, in.Hsl)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	return emit(info)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func schemeOp(ctx context.Context, in schemeInput, emit func(*SchemeColor) error) error {
+	if in.Hex == "" {
+		return errs.Usage("hex argument is required")
+	}
+	mode := in.Mode
+	if mode == "" {
+		mode = "complement"
+	}
+	count := in.Count
+	if count <= 0 {
+		count = 5
+	}
+	colors, err := in.Client.Scheme(ctx, in.Hex, mode, count)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range colors {
+		if err := emit(&colors[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// --- Resolver ---
 
-// Classify turns any accepted input — a bare path or a full colorapi.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns an input into the canonical (type, id).
+// Kit derives URI types from struct names: ColorInfo → colorinfo, SchemeColor → schemecolor.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized colorapi reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty colorapi reference")
 	}
-	return "page", id, nil
+	// strip leading # for hex colors
+	hex := strings.TrimPrefix(input, "#")
+	return "colorinfo", hex, nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "colorinfo":
+		return fmt.Sprintf("https://%s/id?hex=%s", Host, id), nil
+	case "schemecolor":
+		return fmt.Sprintf("https://%s/scheme?hex=%s", Host, id), nil
+	default:
 		return "", errs.Usage("colorapi has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind.
 func mapErr(err error) error {
 	return err
 }
